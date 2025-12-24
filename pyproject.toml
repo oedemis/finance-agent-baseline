@@ -1,3 +1,7 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
 [project]
 name = "finance-agent-baseline"
 version = "1.0.0"
@@ -6,11 +10,12 @@ authors = [
     {name = "Finance Agent Benchmark Team"}
 ]
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 dependencies = [
-    "a2a-sdk>=0.1.0",
+    "a2a-sdk>=0.3.5",
     "pydantic>=2.0.0",
     "uvicorn>=0.27.0",
+    "starlette>=0.35.0",
     "openai>=1.0.0",
     "python-dotenv>=1.0.0",
 ]
@@ -23,17 +28,16 @@ dev = [
     "ruff>=0.1.0",
 ]
 
-[build-system]
-requires = ["setuptools>=68.0.0", "wheel"]
-build-backend = "setuptools.build_meta"
+[tool.uv]
+package = true
 
-[tool.setuptools.packages.find]
-where = ["src"]
+[tool.hatch.build.targets.wheel]
+packages = ["src"]
 
 [tool.black]
 line-length = 100
-target-version = ['py310']
+target-version = ['py311']
 
 [tool.ruff]
 line-length = 100
-target-version = "py310"
+target-version = "py311"
