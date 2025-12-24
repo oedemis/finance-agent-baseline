@@ -3,21 +3,20 @@ Finance Agent Baseline - Purple agent for Finance Agent Benchmark.
 
 This is a baseline agent that:
 1. Receives financial research tasks from the Green Agent
-2. Uses an LLM to decide which tools to use
+2. Uses an LLM (via LiteLLM) to decide which tools to use
 3. Returns tool calls in the expected format
 4. Submits final answers when ready
+
+Uses LiteLLM for LLM calls to support multiple providers.
 """
 import argparse
-import asyncio
 import json
 import logging
 import os
-import re
-from typing import Any
 
+import litellm
 import uvicorn
 from dotenv import load_dotenv
-from openai import AsyncOpenAI
 from starlette.applications import Starlette
 from starlette.responses import JSONResponse
 from starlette.routing import Route
@@ -37,18 +36,28 @@ from a2a.types import (
     Task,
     TaskState,
     TextPart,
+    UnsupportedOperationError,
+    InvalidRequestError,
 )
-from a2a.utils import new_agent_text_message, new_task
+from a2a.utils import new_agent_text_message, new_task, get_message_text
+from a2a.utils.errors import ServerError
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("finance_agent")
 
 
+TERMINAL_STATES = {
+    TaskState.completed,
+    TaskState.canceled,
+    TaskState.failed,
+    TaskState.rejected
+}
+
+
 class FinanceAgent:
-    """Baseline agent that uses OpenAI to answer financial research questions."""
+    """Baseline agent that uses LiteLLM to answer financial research questions."""
 
     def __init__(self, model: str = "gpt-4o", temperature: float = 0.0):
-        self.client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
         self.model = model
         self.temperature = temperature
         self.conversation_history: list[dict] = []
@@ -65,7 +74,7 @@ class FinanceAgent:
         })
 
         try:
-            response = await self.client.chat.completions.create(
+            response = await litellm.acompletion(
                 model=self.model,
                 messages=self._get_system_messages() + self.conversation_history,
                 temperature=self.temperature,
@@ -83,8 +92,8 @@ class FinanceAgent:
             return assistant_message
 
         except Exception as e:
-            logger.error(f"Error calling OpenAI: {e}")
-            return f"<json>{{\"name\": \"submit_answer\", \"arguments\": {{\"answer\": \"Error: {str(e)}\"}}}}</json>"
+            logger.error(f"Error calling LLM: {e}")
+            return f'<json>{{"name": "submit_answer", "arguments": {{"answer": "Error: {str(e)}"}}}}</json>'
 
     def _get_system_messages(self) -> list[dict]:
         """Get system messages for the agent."""
@@ -133,38 +142,47 @@ Always think step by step about what information you need and which tools will h
 class FinanceAgentExecutor(AgentExecutor):
     """Executor that wraps the FinanceAgent for A2A protocol."""
 
-    def __init__(self, agent: FinanceAgent):
-        self.agent = agent
-        self.conversations: dict[str, bool] = {}
+    def __init__(self, model: str = "gpt-4o", temperature: float = 0.0):
+        self.model = model
+        self.temperature = temperature
+        self.agents: dict[str, FinanceAgent] = {}
 
     async def execute(
         self,
         context: RequestContext,
         event_queue: EventQueue,
     ) -> None:
-        message = context.get_user_input()
-        context_id = context.context_id
-
-        # Check if this is a new conversation
-        is_new = context_id not in self.conversations
-        self.conversations[context_id] = True
-
-        # Create task
         msg = context.message
-        if msg:
+        if not msg:
+            raise ServerError(error=InvalidRequestError(message="Missing message in request"))
+
+        task = context.current_task
+        if task and task.status.state in TERMINAL_STATES:
+            raise ServerError(
+                error=InvalidRequestError(
+                    message=f"Task {task.id} already processed (state: {task.status.state})"
+                )
+            )
+
+        if not task:
             task = new_task(msg)
             await event_queue.enqueue_event(task)
-        else:
-            return
 
-        updater = TaskUpdater(event_queue, task.id, task.context_id)
-        await updater.update_status(
-            TaskState.working,
-            new_agent_text_message("Processing...", context_id=context_id)
-        )
+        context_id = task.context_id
+        agent = self.agents.get(context_id)
+        if not agent:
+            agent = FinanceAgent(model=self.model, temperature=self.temperature)
+            self.agents[context_id] = agent
+
+        # Check if this is a new conversation
+        is_new = len(agent.conversation_history) == 0
+        message_text = get_message_text(msg)
+
+        updater = TaskUpdater(event_queue, task.id, context_id)
+        await updater.start_work()
 
         try:
-            response = await self.agent.process_message(message, new_conversation=is_new)
+            response = await agent.process_message(message_text, new_conversation=is_new)
 
             await updater.add_artifact(
                 parts=[Part(root=TextPart(text=response))],
@@ -175,16 +193,16 @@ class FinanceAgentExecutor(AgentExecutor):
         except Exception as e:
             logger.error(f"Agent error: {e}")
             await updater.failed(
-                new_agent_text_message(f"Error: {e}", context_id=context_id)
+                new_agent_text_message(f"Error: {e}", context_id=context_id, task_id=task.id)
             )
 
     async def cancel(
-        self, request: RequestContext, event_queue: EventQueue
+        self, context: RequestContext, event_queue: EventQueue
     ) -> Task | None:
-        return None
+        raise ServerError(error=UnsupportedOperationError())
 
 
-def finance_agent_card(name: str, url: str) -> AgentCard:
+def create_agent_card(url: str) -> AgentCard:
     """Create the agent card for the finance agent."""
     skill = AgentSkill(
         id="finance_research",
@@ -197,7 +215,7 @@ def finance_agent_card(name: str, url: str) -> AgentCard:
         ],
     )
     return AgentCard(
-        name=name,
+        name="FinanceAgentBaseline",
         description="Baseline financial research agent for Finance Agent Benchmark",
         url=url,
         version="1.0.0",
@@ -217,12 +235,12 @@ async def health_check(request):
     })
 
 
-async def main():
+def main():
     parser = argparse.ArgumentParser(description="Run the Finance Agent Baseline.")
     parser.add_argument("--host", type=str, default="127.0.0.1", help="Host to bind")
     parser.add_argument("--port", type=int, default=9019, help="Port to bind")
     parser.add_argument("--card-url", type=str, help="External URL for agent card")
-    parser.add_argument("--model", type=str, default="gpt-4o", help="OpenAI model to use")
+    parser.add_argument("--model", type=str, default="gpt-4o", help="LLM model to use")
     parser.add_argument("--temperature", type=float, default=0.0, help="Temperature")
     args = parser.parse_args()
 
@@ -232,12 +250,10 @@ async def main():
     model = os.getenv("AGENT_MODEL", args.model)
     temperature = float(os.getenv("AGENT_TEMPERATURE", args.temperature))
 
-    agent = FinanceAgent(model=model, temperature=temperature)
-    executor = FinanceAgentExecutor(agent)
-    agent_card = finance_agent_card("FinanceAgentBaseline", agent_url)
+    agent_card = create_agent_card(agent_url)
 
     request_handler = DefaultRequestHandler(
-        agent_executor=executor,
+        agent_executor=FinanceAgentExecutor(model=model, temperature=temperature),
         task_store=InMemoryTaskStore(),
     )
 
@@ -256,15 +272,12 @@ async def main():
     app = Starlette(routes=routes)
     app.mount("/", a2a_app)
 
-    uvicorn_config = uvicorn.Config(app, host=args.host, port=args.port)
-    uvicorn_server = uvicorn.Server(uvicorn_config)
-
     logger.info(f"Starting Finance Agent Baseline on {args.host}:{args.port}")
     logger.info(f"Using model: {model}, temperature: {temperature}")
     logger.info(f"Health check: http://{args.host}:{args.port}/health")
 
-    await uvicorn_server.serve()
+    uvicorn.run(app, host=args.host, port=args.port)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
