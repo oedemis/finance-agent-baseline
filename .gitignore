@@ -49,3 +49,6 @@ htmlcov/
 # OS
 .DS_Store
 Thumbs.db
+
+# Python version management
+.python-version

@@ -99,15 +99,14 @@ class FinanceAgent:
         """Get system messages for the agent."""
         return [{
             "role": "system",
-            "content": """You are a financial research agent. You must respond with a JSON object wrapped in <json>...</json> tags.
+            "content": """You are a financial research agent. Today is December 24, 2025.
 
-IMPORTANT RULES:
-1. Always respond with exactly ONE tool call at a time
-2. Use the tools provided to gather information
-3. When you have enough information, use submit_answer to provide your final answer
-4. Be thorough but efficient - avoid redundant tool calls
+You will receive a question and available tools to research the answer.
+You may not interact with the user directly.
 
 RESPONSE FORMAT:
+
+For tool calls, respond with <json>...</json> tags:
 <json>
 {
   "name": "tool_name",
@@ -115,34 +114,31 @@ RESPONSE FORMAT:
 }
 </json>
 
-AVAILABLE TOOLS:
-- edgar_search: Search SEC EDGAR for filings
-- google_web_search: Search the web
-- parse_html_page: Parse and store webpage content
-- retrieve_information: Extract info from stored documents (use {{key}} placeholders)
-- submit_answer: Submit your final answer
+When you have the final answer, respond with:
 
-EXAMPLE RESPONSES:
-<json>
-{"name": "edgar_search", "arguments": {"query": "quarterly revenue", "form_types": ["10-Q"], "ciks": [], "start_date": "2024-01-01", "end_date": "2024-12-31", "page": "1", "top_n_results": 5}}
-</json>
+FINAL ANSWER: [Your comprehensive answer here, including all key facts, numbers, dates, and details]
 
-<json>
-{"name": "google_web_search", "arguments": {"search_query": "Apple Inc Q4 2024 earnings"}}
-</json>
+{
+    "sources": [
+        {
+            "url": "https://example.com",
+            "name": "Name of the source"
+        }
+    ]
+}
 
-<json>
-{"name": "submit_answer", "arguments": {"answer": "Based on my research..."}}
-</json>
-
-Always think step by step about what information you need and which tools will help you find it."""
+IMPORTANT:
+- Follow the research requirements provided in the task description
+- Use multiple sources to verify information
+- Include specific numbers, dates, and details in your final answer
+- Always provide sources with URLs and names"""
         }]
 
 
 class FinanceAgentExecutor(AgentExecutor):
     """Executor that wraps the FinanceAgent for A2A protocol."""
 
-    def __init__(self, model: str = "gpt-4o", temperature: float = 0.0):
+    def __init__(self, model: str = "openai/gpt-4o-mini", temperature: float = 0.0):
         self.model = model
         self.temperature = temperature
         self.agents: dict[str, FinanceAgent] = {}
