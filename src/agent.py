@@ -4,10 +4,11 @@ Finance Agent Baseline - Purple agent for Finance Agent Benchmark.
 This is a baseline agent that:
 1. Receives financial research tasks from the Green Agent
 2. Uses an LLM (via LiteLLM) to decide which tools to use
-3. Returns tool calls in the expected format
+3. Calls tools directly via MCP (Model Context Protocol)
 4. Submits final answers when ready
 
 Uses LiteLLM for LLM calls to support multiple providers.
+Uses MCP for tool access (no text parsing required).
 """
 import argparse
 import json
@@ -22,6 +23,8 @@ from starlette.responses import JSONResponse
 from starlette.routing import Route
 
 load_dotenv()
+
+from mcp_client import FinanceToolsClient
 
 from a2a.server.apps import A2AStarletteApplication
 from a2a.server.agent_execution import AgentExecutor, RequestContext
@@ -55,15 +58,33 @@ TERMINAL_STATES = {
 
 
 class FinanceAgent:
-    """Baseline agent that uses LiteLLM to answer financial research questions."""
+    """Baseline agent that uses LiteLLM and MCP to answer financial research questions."""
 
-    def __init__(self, model: str = "gpt-4o", temperature: float = 0.0):
+    def __init__(self, model: str = "gpt-4o", temperature: float = 0.0, context_id: str = "default"):
         self.model = model
         self.temperature = temperature
+        self.context_id = context_id
         self.conversation_history: list[dict] = []
+        self.mcp_client: FinanceToolsClient | None = None
 
-    async def process_message(self, message: str, new_conversation: bool = False) -> str:
-        """Process a message and return the response."""
+    async def _ensure_mcp_connected(self):
+        """Connect to MCP server if not already connected."""
+        if not self.mcp_client:
+            self.mcp_client = FinanceToolsClient(context_id=self.context_id)
+            await self.mcp_client.connect()
+            logger.info(f"Connected to MCP server for context {self.context_id}")
+
+    async def process_message(self, message: str, new_conversation: bool = False) -> tuple[str, dict | None]:
+        """
+        Process a message by looping internally with LLM and MCP tools.
+
+        Returns:
+            tuple: (status_message, final_answer_data)
+                - status_message: Human-readable completion message
+                - final_answer_data: Structured answer data if submit_answer was called, None otherwise
+        """
+        await self._ensure_mcp_connected()
+
         if new_conversation:
             self.conversation_history = []
 
@@ -73,65 +94,132 @@ class FinanceAgent:
             "content": message
         })
 
+        # Loop until submit_answer is called
+        max_iterations = 50  # Safety limit to prevent infinite loops
+
+        for iteration in range(max_iterations):
+            try:
+                # Get LLM response with function calling (tools from MCP server)
+                response = await litellm.acompletion(
+                    model=self.model,
+                    messages=self._get_system_messages() + self.conversation_history,
+                    temperature=self.temperature,
+                    max_tokens=512,
+                    tools=self.mcp_client.get_tools_for_llm(),  # Dynamic from MCP!
+                    tool_choice="auto",
+                )
+
+                assistant_message = response.choices[0].message
+
+                # Add assistant response to history (use model_dump() to preserve exact format)
+                message_dict = {
+                    "role": "assistant",
+                    "content": assistant_message.content
+                }
+
+                # Add tool_calls if present (preserve exact LiteLLM format)
+                if assistant_message.tool_calls:
+                    message_dict["tool_calls"] = [
+                        tc.model_dump() if hasattr(tc, 'model_dump') else tc
+                        for tc in assistant_message.tool_calls
+                    ]
+
+                self.conversation_history.append(message_dict)
+
+                tool_calls = assistant_message.tool_calls
+
+                logger.debug(f"Iteration {iteration + 1}: content={assistant_message.content[:100] if assistant_message.content else '(no content)'}, tool_calls={len(tool_calls) if tool_calls else 0}")
+
+                # Check if LLM called any tools
+                if not tool_calls:
+                    # No tool call - LLM might be reasoning or stuck
+                    logger.warning(f"No tool call found in iteration {iteration + 1}")
+                    # Add a nudge to use tools
+                    self.conversation_history.append({
+                        "role": "user",
+                        "content": "Please use one of the available tools to continue your research, or call submit_answer if you're ready."
+                    })
+                    continue
+
+                # Process first tool call (we don't support parallel calls yet)
+                tool_call = tool_calls[0]
+                tool_name = tool_call.function.name
+                tool_args = json.loads(tool_call.function.arguments)
+
+                logger.info(f"Calling tool: {tool_name}")
+
+                # Call tool via MCP
+                result = await self._call_tool_via_mcp(tool_name, tool_args)
+
+                # Check if this was submit_answer (task complete)
+                if tool_name == "submit_answer":
+                    logger.info("Task complete - submit_answer called")
+                    # Return both status message and structured answer data
+                    return (
+                        f"Research complete. Final answer submitted.\n\nIterations: {iteration + 1}",
+                        {
+                            "answer": tool_args.get("answer", ""),
+                            "sources": tool_args.get("sources", [])
+                        }
+                    )
+
+                # Add tool result to conversation for next iteration (using OpenAI format)
+                self.conversation_history.append({
+                    "role": "tool",
+                    "tool_call_id": tool_call.id,
+                    "name": tool_name,
+                    "content": json.dumps(result)
+                })
+
+            except Exception as e:
+                logger.error(f"Error in iteration {iteration + 1}: {e}")
+                # Try to submit error as final answer
+                try:
+                    error_answer = f"Error during research: {str(e)}"
+                    await self.mcp_client.submit_answer(
+                        answer=error_answer,
+                        sources=[]
+                    )
+                    return (
+                        f"Error occurred, submitted error answer: {e}",
+                        {"answer": error_answer, "sources": []}
+                    )
+                except:
+                    return (f"Critical error: {e}", None)
+
+        # Max iterations reached without submit_answer
+        logger.warning(f"Max iterations ({max_iterations}) reached without submitting answer")
         try:
-            response = await litellm.acompletion(
-                model=self.model,
-                messages=self._get_system_messages() + self.conversation_history,
-                temperature=self.temperature,
-                max_tokens=2000,
+            incomplete_answer = "Unable to complete research within iteration limit."
+            await self.mcp_client.submit_answer(
+                answer=incomplete_answer,
+                sources=[]
             )
+            return (
+                f"Max iterations reached. Submitted incomplete answer.",
+                {"answer": incomplete_answer, "sources": []}
+            )
+        except:
+            return ("Max iterations reached without submitting answer", None)
 
-            assistant_message = response.choices[0].message.content
-
-            # Add assistant response to history
-            self.conversation_history.append({
-                "role": "assistant",
-                "content": assistant_message
-            })
-
-            return assistant_message
-
+    async def _call_tool_via_mcp(self, tool_name: str, tool_args: dict) -> dict:
+        """Call any tool generically via MCP (tool-agnostic)."""
+        try:
+            # Generic tool execution - works with ANY tool discovered from MCP
+            return await self.mcp_client.call_tool(tool_name, tool_args)
         except Exception as e:
-            logger.error(f"Error calling LLM: {e}")
-            return f'<json>{{"name": "submit_answer", "arguments": {{"answer": "Error: {str(e)}"}}}}</json>'
+            logger.error(f"Error calling tool {tool_name}: {e}")
+            return {
+                "success": False,
+                "result": f"Tool execution error: {str(e)}"
+            }
 
     def _get_system_messages(self) -> list[dict]:
         """Get system messages for the agent."""
         return [{
             "role": "system",
-            "content": """You are a financial research agent. Today is December 24, 2025.
-
-You will receive a question and available tools to research the answer.
-You may not interact with the user directly.
-
-RESPONSE FORMAT:
-
-For tool calls, respond with <json>...</json> tags:
-<json>
-{
-  "name": "tool_name",
-  "arguments": {...}
-}
-</json>
-
-When you have the final answer, respond with:
-
-FINAL ANSWER: [Your comprehensive answer here, including all key facts, numbers, dates, and details]
-
-{
-    "sources": [
-        {
-            "url": "https://example.com",
-            "name": "Name of the source"
-        }
-    ]
-}
-
-IMPORTANT:
-- Follow the research requirements provided in the task description
-- Use multiple sources to verify information
-- Include specific numbers, dates, and details in your final answer
-- Always provide sources with URLs and names"""
+            "content": """You are a financial research agent. Today is December 26, 2025.
+            Include all key facts, numbers, dates, and details. Be specific and factual."""
         }]
 
 
@@ -167,7 +255,11 @@ class FinanceAgentExecutor(AgentExecutor):
         context_id = task.context_id
         agent = self.agents.get(context_id)
         if not agent:
-            agent = FinanceAgent(model=self.model, temperature=self.temperature)
+            agent = FinanceAgent(
+                model=self.model,
+                temperature=self.temperature,
+                context_id=context_id  # Pass context_id for MCP state isolation
+            )
             self.agents[context_id] = agent
 
         # Check if this is a new conversation
@@ -178,10 +270,18 @@ class FinanceAgentExecutor(AgentExecutor):
         await updater.start_work()
 
         try:
-            response = await agent.process_message(message_text, new_conversation=is_new)
+            status_message, answer_data = await agent.process_message(message_text, new_conversation=is_new)
+
+            # Create parts for the artifact
+            parts = [Part(root=TextPart(text=status_message))]
+
+            # If we have structured answer data, include it as DataPart
+            if answer_data:
+                from a2a.types import DataPart
+                parts.append(Part(root=DataPart(data=answer_data)))
 
             await updater.add_artifact(
-                parts=[Part(root=TextPart(text=response))],
+                parts=parts,
                 name="Response",
             )
             await updater.complete()
