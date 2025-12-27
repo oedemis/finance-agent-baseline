@@ -4,6 +4,7 @@ MCP Client for Purple Agent.
 Connects to the green agent's MCP server to access financial research tools.
 Auto-injects context_id for state isolation across concurrent tasks.
 """
+import asyncio
 import logging
 import os
 from typing import Optional
