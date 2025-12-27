@@ -20,7 +20,7 @@ class FinanceToolsClient:
 
     Features:
     - Auto-injects context_id for state isolation
-    - Convenience methods for each tool
+    - Proper async context manager usage for FastMCP Client
     - Connection pooling (reuses same client)
     - Error handling with fallback
     """
@@ -37,14 +37,22 @@ class FinanceToolsClient:
         self.mcp_server_url = mcp_server_url or os.getenv("MCP_SERVER_URL", "http://127.0.0.1:9020")
         self.context_id = context_id or "default"
         self._client: Optional[Client] = None
-        self._connected = False
+        self._tools = None
 
         logger.info(f"FinanceToolsClient initialized: server={self.mcp_server_url}, context={self.context_id}")
 
-    async def connect(self):
+    async def connect(self, force_reconnect=False):
         """Connect to MCP server and discover tools."""
-        if self._connected:
+        if self._client and not force_reconnect:
             return
+
+        # Clean up old connection if forcing reconnect
+        if force_reconnect and self._client:
+            try:
+                await self._client.__aexit__(None, None, None)
+            except:
+                pass
+            self._client = None
 
         try:
             # Append /mcp to URL if not present (FastMCP convention)
@@ -52,14 +60,15 @@ class FinanceToolsClient:
             if not url.endswith("/mcp"):
                 url = f"{url}/mcp"
 
+            # Create Client - it will be used as context manager
             self._client = Client(url)
+
+            # Enter the client context
             await self._client.__aenter__()
-            self._connected = True
 
             # Discover available tools
-            tools = await self._client.list_tools()
-            self._tools = tools  # Store for later access
-            tool_names = [t.name for t in tools]
+            self._tools = await self._client.list_tools()
+            tool_names = [t.name for t in self._tools]
             logger.info(f"Connected to MCP server. Available tools: {tool_names}")
 
         except Exception as e:
@@ -76,11 +85,10 @@ class FinanceToolsClient:
         Returns:
             list[dict]: Tools in OpenAI format for LiteLLM
         """
-        if not hasattr(self, '_tools'):
+        if not self._tools:
             raise RuntimeError("Not connected to MCP server. Call connect() first.")
 
         # Convert MCP Tool schemas to OpenAI function calling format
-        # MCP already uses JSON Schema for inputSchema, so this is straightforward
         return [
             {
                 "type": "function",
@@ -95,10 +103,11 @@ class FinanceToolsClient:
 
     async def disconnect(self):
         """Disconnect from MCP server."""
-        if self._client and self._connected:
+        if self._client:
             try:
                 await self._client.__aexit__(None, None, None)
-                self._connected = False
+                self._client = None
+                self._tools = None
                 logger.info("Disconnected from MCP server")
             except Exception as e:
                 logger.warning(f"Error during disconnect: {e}")
@@ -114,7 +123,7 @@ class FinanceToolsClient:
         Returns:
             dict: Tool result from MCP server
         """
-        if not self._connected:
+        if not self._client:
             await self.connect()
 
         try:
@@ -123,33 +132,65 @@ class FinanceToolsClient:
 
             logger.debug(f"Calling MCP tool '{tool_name}' with args: {list(arguments.keys())}")
 
-            # FIX: Wrap the call in a timeout to break the FastMCP stream lock (Bug #691)
-            # In high-concurrency environments, zombie tasks (never finish, never error) are
-            # more dangerous than crashes. Fail-fast principle ensures retry logic can trigger.
-            try:
-                result = await asyncio.wait_for(
-                    self._client.call_tool(tool_name, arguments),
-                    timeout=30.0  # Adjust based on expected tool latency
-                )
-            except asyncio.TimeoutError:
-                logger.error(f"Timeout: FastMCP client hung on tool '{tool_name}' (StreamableHTTP bug)")
-                return {"success": False, "result": "Client-side timeout/deadlock"}
+            # Call tool with timeout to prevent indefinite hangs
+            # 60s should be enough for any real tool call (server-side completes in 2-3s typically)
+            result = await asyncio.wait_for(
+                self._client.call_tool(tool_name, arguments),
+                timeout=60.0
+            )
 
-            # Extract data from MCP result
-            # FastMCP returns CallToolResult with .data attribute
-            if hasattr(result, 'data'):
+            # DEBUG: Log what we received
+            logger.info(f"MCP tool '{tool_name}' RAW RESULT: type={type(result)}, has_data={hasattr(result, 'data')}, is_iterable={hasattr(result, '__iter__')}")
+
+            # Extract data from result
+            # FastMCP returns different formats depending on the tool
+            if hasattr(result, '__iter__') and not isinstance(result, (str, bytes, dict)):
+                # If it's an iterable (like async generator), collect results
+                logger.info(f"MCP tool '{tool_name}' is async iterable, collecting results...")
+                results = []
+                async for item in result:
+                    logger.debug(f"Got item: type={type(item)}, has_data={hasattr(item, 'data')}")
+                    if hasattr(item, 'data'):
+                        results.append(item.data)
+                    else:
+                        results.append(item)
+                logger.info(f"MCP tool '{tool_name}' collected {len(results)} items from async iterator")
+                return {"success": True, "result": results[0] if len(results) == 1 else results}
+            elif hasattr(result, 'data'):
                 return result.data
+            elif isinstance(result, dict):
+                return result
             else:
-                # Fallback: parse from content blocks
-                if hasattr(result, 'content') and result.content:
-                    return {"result": result.content[0].text}
                 return {"result": str(result)}
 
-        except Exception as e:
-            logger.error(f"Tool '{tool_name}' failed: {e}")
+        except asyncio.TimeoutError:
+            logger.error(f"Tool '{tool_name}' timed out after 60s (client-side hang)")
+            # Force reconnect after timeout
+            try:
+                await self.connect(force_reconnect=True)
+                logger.info("Reconnected after timeout")
+            except:
+                pass
             return {
                 "success": False,
-                "result": f"MCP tool call failed: {str(e)}"
+                "error": f"Tool '{tool_name}' timed out - client did not receive response within 60s"
+            }
+        except Exception as e:
+            error_msg = str(e)
+            logger.error(f"Tool '{tool_name}' failed: {e}")
+
+            # If client disconnected, try to reconnect
+            if "not connected" in error_msg.lower() or "client is not" in error_msg.lower():
+                try:
+                    logger.info("Client disconnected, attempting reconnect...")
+                    await self.connect(force_reconnect=True)
+                    logger.info("Reconnected successfully")
+                except Exception as reconnect_error:
+                    logger.error(f"Reconnect failed: {reconnect_error}")
+
+            return {
+                "success": False,
+                "error": f"MCP tool call failed: {error_msg}"
             }
 
     # === Context Manager ===

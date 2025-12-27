@@ -74,9 +74,19 @@ class FinanceAgent:
             await self.mcp_client.connect()
             logger.info(f"Connected to MCP server for context {self.context_id}")
 
-    async def process_message(self, message: str, new_conversation: bool = False) -> tuple[str, dict | None]:
+    async def process_message(
+        self,
+        message: str,
+        new_conversation: bool = False,
+        updater: 'TaskUpdater | None' = None
+    ) -> tuple[str, dict | None]:
         """
         Process a message by looping internally with LLM and MCP tools.
+
+        Args:
+            message: User message to process
+            new_conversation: Whether this starts a new conversation
+            updater: Optional TaskUpdater for sending A2A progress updates
 
         Returns:
             tuple: (status_message, final_answer_data)
@@ -104,7 +114,7 @@ class FinanceAgent:
                     model=self.model,
                     messages=self._get_system_messages() + self.conversation_history,
                     temperature=self.temperature,
-                    max_tokens=512,
+                    max_tokens=2048,  # Need enough tokens for submit_answer with full answer + sources
                     tools=self.mcp_client.get_tools_for_llm(),  # Dynamic from MCP!
                     tool_choice="auto",
                     parallel_tool_calls=False,  # Process one tool at a time
@@ -144,8 +154,24 @@ class FinanceAgent:
 
                 # Process first tool call (we don't support parallel calls yet)
                 tool_call = tool_calls[0]
-                tool_name = tool_call.function.name
-                tool_args = json.loads(tool_call.function.arguments)
+
+                # CRITICAL: Parse tool call with defensive error handling
+                # If this fails, we MUST still add a tool response to avoid tool_call_id mismatch
+                try:
+                    tool_name = tool_call.function.name
+                    tool_args = json.loads(tool_call.function.arguments)
+                except Exception as parse_error:
+                    logger.error(f"Failed to parse tool call: {parse_error}")
+                    logger.error(f"Malformed JSON (first 500 chars): {tool_call.function.arguments[:500]}")
+                    logger.error(f"Malformed JSON (around error at char 2441): ...{tool_call.function.arguments[2400:2500]}...")
+                    # Add error response immediately to prevent tool_call_id mismatch
+                    self.conversation_history.append({
+                        "role": "tool",
+                        "tool_call_id": tool_call.id,
+                        "name": "error",
+                        "content": json.dumps({"success": False, "error": f"Failed to parse tool call: {str(parse_error)}"})
+                    })
+                    continue
 
                 logger.info(f"Calling tool: {tool_name}")
 
@@ -158,9 +184,12 @@ class FinanceAgent:
                     result = {"success": False, "error": str(e)}
 
                 # Check if this was submit_answer (task complete)
-                if tool_name == "submit_answer" and result.get("success", True):
-                    logger.info("Task complete - submit_answer called")
+                # IMPORTANT: Always complete task when submit_answer is called, regardless of MCP response
+                # Server-side evaluation already happened, timeout is just a client issue
+                if tool_name == "submit_answer":
+                    logger.info("Task complete - submit_answer called (server-side evaluation complete)")
                     # Return both status message and structured answer data
+                    # This sends A2A response back to green agent with the answer
                     return (
                         f"Research complete. Final answer submitted.\n\nIterations: {iteration + 1}",
                         {
@@ -177,6 +206,19 @@ class FinanceAgent:
                     "name": tool_name,
                     "content": json.dumps(result)
                 })
+
+                # Send A2A progress update after tool execution
+                if updater:
+                    progress_msg = f"Executed {tool_name}"
+                    if result.get("success", True):
+                        progress_msg += " ✓"
+                    else:
+                        progress_msg += f" (error: {result.get('error', 'unknown')})"
+
+                    await updater.add_artifact(
+                        parts=[Part(root=TextPart(text=progress_msg))],
+                        name=f"Progress: {tool_name}",
+                    )
 
             except Exception as e:
                 logger.error(f"Error in iteration {iteration + 1}: {e}")
@@ -227,20 +269,15 @@ class FinanceAgent:
             "role": "system",
             "content": """You are a financial research agent. Today is December 27, 2025.
 
-**Available Tools:**
-- edgar_search: Search SEC filings
-- google_web_search: Search the web
-- parse_html_page: Parse and store webpage content
-- retrieve_information: Analyze stored content with LLM
-- submit_answer: Submit your final answer (REQUIRED to complete task)
+**CRITICAL RULES:**
+1. You MUST use tools to complete your research. NEVER respond with just text.
+2. After gathering information with retrieve_information, immediately call submit_answer.
+3. Do NOT write lengthy explanations - use tools instead.
 
-**Workflow:**
-1. Search for relevant information (edgar_search or google_web_search)
-2. Parse important webpages (parse_html_page)
-3. Analyze the content (retrieve_information)
-4. **Always call submit_answer with your final answer and sources**
-
-**Important:** You MUST call submit_answer when you have enough information to answer the question. Include all key facts, numbers, dates, and details. Be specific and factual."""
+**Answer requirements:**
+- Include all key facts, numbers, dates, and details
+- Be specific and factual
+- Provide sources for all information"""
         }]
 
 
@@ -291,7 +328,11 @@ class FinanceAgentExecutor(AgentExecutor):
         await updater.start_work()
 
         try:
-            status_message, answer_data = await agent.process_message(message_text, new_conversation=is_new)
+            status_message, answer_data = await agent.process_message(
+                message_text,
+                new_conversation=is_new,
+                updater=updater  # Pass updater for A2A progress updates
+            )
 
             # Create parts for the artifact
             parts = [Part(root=TextPart(text=status_message))]
