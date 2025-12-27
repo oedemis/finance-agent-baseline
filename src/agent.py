@@ -107,6 +107,7 @@ class FinanceAgent:
                     max_tokens=512,
                     tools=self.mcp_client.get_tools_for_llm(),  # Dynamic from MCP!
                     tool_choice="auto",
+                    parallel_tool_calls=False,  # Process one tool at a time
                 )
 
                 assistant_message = response.choices[0].message
