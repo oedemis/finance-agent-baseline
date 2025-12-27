@@ -150,15 +150,9 @@ class FinanceAgent:
                 logger.info(f"Calling tool: {tool_name}")
 
                 # Call tool via MCP - catch errors to ensure we always add tool response
-                # Add timeout to prevent FastMCP StreamableHTTP hanging bug (Issue #691)
+                # Timeout is handled inside mcp_client.call_tool() to prevent FastMCP hanging
                 try:
-                    result = await asyncio.wait_for(
-                        self._call_tool_via_mcp(tool_name, tool_args),
-                        timeout=30.0  # 30 second timeout per tool call
-                    )
-                except asyncio.TimeoutError:
-                    logger.error(f"Tool {tool_name} timed out after 30s (FastMCP hanging bug)")
-                    result = {"success": False, "error": f"Tool {tool_name} timed out after 30 seconds"}
+                    result = await self._call_tool_via_mcp(tool_name, tool_args)
                 except Exception as e:
                     logger.error(f"Tool {tool_name} failed: {e}")
                     result = {"success": False, "error": str(e)}

@@ -122,7 +122,17 @@ class FinanceToolsClient:
 
             logger.debug(f"Calling MCP tool '{tool_name}' with args: {list(arguments.keys())}")
 
-            result = await self._client.call_tool(tool_name, arguments)
+            # FIX: Wrap the call in a timeout to break the FastMCP stream lock (Bug #691)
+            # In high-concurrency environments, zombie tasks (never finish, never error) are
+            # more dangerous than crashes. Fail-fast principle ensures retry logic can trigger.
+            try:
+                result = await asyncio.wait_for(
+                    self._client.call_tool(tool_name, arguments),
+                    timeout=30.0  # Adjust based on expected tool latency
+                )
+            except asyncio.TimeoutError:
+                logger.error(f"Timeout: FastMCP client hung on tool '{tool_name}' (StreamableHTTP bug)")
+                return {"success": False, "result": "Client-side timeout/deadlock"}
 
             # Extract data from MCP result
             # FastMCP returns CallToolResult with .data attribute
