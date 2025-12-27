@@ -133,10 +133,12 @@ class FinanceToolsClient:
             logger.debug(f"Calling MCP tool '{tool_name}' with args: {list(arguments.keys())}")
 
             # Call tool with timeout to prevent indefinite hangs
-            # 60s should be enough for any real tool call (server-side completes in 2-3s typically)
+            # submit_answer runs LLM judges (3 judge calls) which can take 20-30s
+            # Other tools complete in 2-3s typically
+            timeout = 120.0 if tool_name == "submit_answer" else 60.0
             result = await asyncio.wait_for(
                 self._client.call_tool(tool_name, arguments),
-                timeout=60.0
+                timeout=timeout
             )
 
             # DEBUG: Log what we received
@@ -164,7 +166,8 @@ class FinanceToolsClient:
                 return {"result": str(result)}
 
         except asyncio.TimeoutError:
-            logger.error(f"Tool '{tool_name}' timed out after 60s (client-side hang)")
+            timeout_val = 120.0 if tool_name == "submit_answer" else 60.0
+            logger.error(f"Tool '{tool_name}' timed out after {timeout_val}s (client-side hang)")
             # Force reconnect after timeout
             try:
                 await self.connect(force_reconnect=True)
