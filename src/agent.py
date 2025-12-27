@@ -148,11 +148,15 @@ class FinanceAgent:
 
                 logger.info(f"Calling tool: {tool_name}")
 
-                # Call tool via MCP
-                result = await self._call_tool_via_mcp(tool_name, tool_args)
+                # Call tool via MCP - catch errors to ensure we always add tool response
+                try:
+                    result = await self._call_tool_via_mcp(tool_name, tool_args)
+                except Exception as e:
+                    logger.error(f"Tool {tool_name} failed: {e}")
+                    result = {"success": False, "error": str(e)}
 
                 # Check if this was submit_answer (task complete)
-                if tool_name == "submit_answer":
+                if tool_name == "submit_answer" and result.get("success", True):
                     logger.info("Task complete - submit_answer called")
                     # Return both status message and structured answer data
                     return (
@@ -163,7 +167,8 @@ class FinanceAgent:
                         }
                     )
 
-                # Add tool result to conversation for next iteration (using OpenAI format)
+                # ALWAYS add tool result to conversation (even if it failed)
+                # This prevents tool_call_id mismatch errors
                 self.conversation_history.append({
                     "role": "tool",
                     "tool_call_id": tool_call.id,
