@@ -150,8 +150,15 @@ class FinanceAgent:
                 logger.info(f"Calling tool: {tool_name}")
 
                 # Call tool via MCP - catch errors to ensure we always add tool response
+                # Add timeout to prevent FastMCP StreamableHTTP hanging bug (Issue #691)
                 try:
-                    result = await self._call_tool_via_mcp(tool_name, tool_args)
+                    result = await asyncio.wait_for(
+                        self._call_tool_via_mcp(tool_name, tool_args),
+                        timeout=30.0  # 30 second timeout per tool call
+                    )
+                except asyncio.TimeoutError:
+                    logger.error(f"Tool {tool_name} timed out after 30s (FastMCP hanging bug)")
+                    result = {"success": False, "error": f"Tool {tool_name} timed out after 30 seconds"}
                 except Exception as e:
                     logger.error(f"Tool {tool_name} failed: {e}")
                     result = {"success": False, "error": str(e)}
@@ -224,8 +231,22 @@ class FinanceAgent:
         """Get system messages for the agent."""
         return [{
             "role": "system",
-            "content": """You are a financial research agent. Today is December 26, 2025.
-            Include all key facts, numbers, dates, and details. Be specific and factual."""
+            "content": """You are a financial research agent. Today is December 27, 2025.
+
+**Available Tools:**
+- edgar_search: Search SEC filings
+- google_web_search: Search the web
+- parse_html_page: Parse and store webpage content
+- retrieve_information: Analyze stored content with LLM
+- submit_answer: Submit your final answer (REQUIRED to complete task)
+
+**Workflow:**
+1. Search for relevant information (edgar_search or google_web_search)
+2. Parse important webpages (parse_html_page)
+3. Analyze the content (retrieve_information)
+4. **Always call submit_answer with your final answer and sources**
+
+**Important:** You MUST call submit_answer when you have enough information to answer the question. Include all key facts, numbers, dates, and details. Be specific and factual."""
         }]
 
 
